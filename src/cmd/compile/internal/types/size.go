@@ -203,6 +203,146 @@ func isAtomicStdPkg(p *Pkg) bool {
 	return p.Prefix == "sync/atomic" || p.Prefix == "internal/runtime/atomic"
 }
 
+// hasHostLayout reports whether the struct type t contains a field
+// of type structs.HostLayout, which signals that the struct must
+// preserve platform-compatible layout and should not be reordered.
+func hasHostLayout(t *Type) bool {
+	for _, f := range t.Fields() {
+		sym := f.Type.Sym()
+		if sym != nil && sym.Name == "HostLayout" && sym.Pkg != nil && sym.Pkg.Path == "structs" {
+			return true
+		}
+	}
+	return false
+}
+
+// canReorderFields reports whether the struct type t can have its
+// fields reordered for alignment optimization. It returns false for:
+// - Structs with structs.HostLayout
+// - Parameter tuples
+// - Internal compiler-generated types (fields without package info)
+// - Types from packages that the runtime/reflect depend on
+func canReorderFields(t *Type) bool {
+	// Don't reorder parameter tuples
+	if t.StructType().ParamTuple {
+		return false
+	}
+
+	// Check for HostLayout
+	if hasHostLayout(t) {
+		return false
+	}
+
+	// Check if this is a compiler-generated type (fields have nil Pkg)
+	// Types created via reflectToType have fields with Sym but Pkg is nil
+	for _, f := range t.Fields() {
+		if f.Sym != nil && f.Sym.Pkg == nil {
+			return false
+		}
+	}
+
+	// Don't reorder types from packages that the runtime/reflect system depends on.
+	// Reordering these could break the runtime's assumptions about type layouts.
+	if sym := t.Sym(); sym != nil && sym.Pkg != nil {
+		pkg := sym.Pkg.Path
+		switch {
+		case pkg == "internal/abi",
+			pkg == "runtime",
+			pkg == "reflect",
+			pkg == "internal/reflectlite",
+			pkg == "sync",
+			pkg == "sync/atomic",
+			pkg == "time",
+			pkg == "context":
+			return false
+		}
+		// Exclude internal runtime packages
+		if len(pkg) >= 17 && pkg[:17] == "internal/runtime/" {
+			return false
+		}
+		// Also exclude syscall types which must match C ABI
+		if len(pkg) >= 7 && pkg[:7] == "syscall" {
+			return false
+		}
+		// Exclude internal packages that may have ABI dependencies
+		if len(pkg) >= 9 && pkg[:9] == "internal/" {
+			return false
+		}
+	}
+
+	return true
+}
+
+// calcStructOffsetOptimized computes optimized offsets for struct fields
+// by sorting them by alignment and size to minimize padding.
+// It assigns offsets to the original fields based on where they would be
+// in an optimized memory layout, without changing the field order.
+func calcStructOffsetOptimized(t *Type, fields []*Field) int64 {
+	if len(fields) == 0 {
+		return 0
+	}
+
+	// Calculate sizes for all fields first
+	for _, f := range fields {
+		CalcSize(f.Type)
+	}
+
+	// Create indices sorted by alignment (descending), then size (descending),
+	// then original order for determinism
+	type fieldInfo struct {
+		idx   int
+		align uint8
+		size  int64
+	}
+	indices := make([]fieldInfo, len(fields))
+	for i, f := range fields {
+		indices[i] = fieldInfo{idx: i, align: f.Type.align, size: f.Type.width}
+	}
+
+	slices.SortStableFunc(indices, func(a, b fieldInfo) int {
+		if a.align != b.align {
+			if a.align > b.align {
+				return -1
+			}
+			return 1
+		}
+		if a.size != b.size {
+			if a.size > b.size {
+				return -1
+			}
+			return 1
+		}
+		return a.idx - b.idx
+	})
+
+	// Compute offsets in the optimized order
+	var offset int64
+	for _, info := range indices {
+		f := fields[info.idx]
+		offset = RoundUp(offset, int64(f.Type.align))
+
+		if t.IsStruct() {
+			f.Offset = offset
+			if f.Type.NotInHeap() {
+				t.SetNotInHeap(true)
+			}
+		}
+
+		offset += f.Type.width
+
+		maxwidth := MaxWidth
+		if maxwidth < 1<<32 {
+			maxwidth = 1<<31 - 1
+		}
+		if offset >= maxwidth {
+			base.ErrorfAt(typePos(t), 0, "type %L too large", t)
+			offset = 8
+		}
+	}
+
+	return offset
+}
+
 // CalcSize calculates and stores the size, alignment, eq/hash algorithm,
 // and ptrBytes for t.
 // If CalcSizeDisabled is set, and the size/alignment
@@ -505,13 +645,21 @@ func CalcStructSize(t *Type) {
 
 	fields := t.Fields()
 
-	size := calcStructOffset(t, fields, 0)
+	// Compute field offsets. When FieldAlign is enabled and the struct
+	// can be reordered, use optimized layout that minimizes padding.
+	// The fields array order is preserved to maintain source semantics.
+	var size int64
+	if base.Debug.FieldAlign != 0 && len(fields) > 1 && canReorderFields(t) {
+		size = calcStructOffsetOptimized(t, fields)
+	} else {
+		size = calcStructOffset(t, fields, 0)
+	}
 
 	// For non-zero-sized structs which end in a zero-sized field, we
 	// add an extra byte of padding to the type. This padding ensures
 	// that taking the address of a zero-sized field can't manufacture a
 	// pointer to the next object in the heap. See issue 9401.
-	if size > 0 && fields[len(fields)-1].Type.width == 0 {
+	if size > 0 && len(fields) > 0 && fields[len(fields)-1].Type.width == 0 {
 		size++
 	}
 
@@ -570,11 +718,14 @@ func CalcStructSize(t *Type) {
 		}
 	}
 	// Compute ptrBytes.
-	for i := len(fields) - 1; i >= 0; i-- {
-		f := fields[i]
-		if size := PtrDataSize(f.Type); size > 0 {
-			t.ptrBytes = f.Offset + size
-			break
+	// Find the field with the highest offset that contains pointer data.
+	t.ptrBytes = 0
+	for _, f := range fields {
+		if ptrSize := PtrDataSize(f.Type); ptrSize > 0 {
+			endOffset := f.Offset + ptrSize
+			if endOffset > t.ptrBytes {
+				t.ptrBytes = endOffset
+			}
 		}
 	}
 
