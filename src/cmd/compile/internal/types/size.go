@@ -315,19 +315,6 @@ func calcStructOffsetOptimized(t *Type, fields []*Field) int64 {
 		return a.idx - b.idx
 	})
 
-	// Debug: print sorted order
-	if base.Debug.FieldAlign > 1 {
-		for i, info := range indices {
-			f := fields[info.idx]
-			name := "<blank>"
-			if f.Sym != nil {
-				name = f.Sym.Name
-			}
-			base.WarnfAt(t.Pos(), "  sorted[%d]: field %s (orig idx %d, align %d, size %d)", 
-				i, name, info.idx, info.align, info.size)
-		}
-	}
-
 	// Compute offsets in the optimized order
 	var offset int64
 	for _, info := range indices {
@@ -336,13 +323,6 @@ func calcStructOffsetOptimized(t *Type, fields []*Field) int64 {
 
 		if t.IsStruct() {
 			f.Offset = offset
-			if base.Debug.FieldAlign > 1 {
-				name := "<blank>"
-				if f.Sym != nil {
-					name = f.Sym.Name
-				}
-				base.WarnfAt(t.Pos(), "  assigned offset %d to field %s", offset, name)
-			}
 			if f.Type.NotInHeap() {
 				t.SetNotInHeap(true)
 			}
@@ -358,10 +338,6 @@ func calcStructOffsetOptimized(t *Type, fields []*Field) int64 {
 			base.ErrorfAt(typePos(t), 0, "type %L too large", t)
 			offset = 8
 		}
-	}
-
-	if base.Debug.FieldAlign > 1 {
-		base.WarnfAt(t.Pos(), "  final size: %d", offset)
 	}
 
 	return offset
@@ -669,49 +645,13 @@ func CalcStructSize(t *Type) {
 
 	fields := t.Fields()
 
-	// Debug: Print type address
-	if base.Debug.FieldAlign > 1 && t.Sym() != nil && t.Sym().Name == "Example" {
-		base.WarnfAt(t.Pos(), "CalcStructSize for Example at %p", t)
-	}
-
 	// Compute field offsets. When FieldAlign is enabled and the struct
 	// can be reordered, use optimized layout that minimizes padding.
 	// The fields array order is preserved to maintain source semantics.
 	var size int64
 	if base.Debug.FieldAlign != 0 && len(fields) > 1 && canReorderFields(t) {
-		if base.Debug.FieldAlign > 1 {
-			// Print debug info when -d=fieldalign=2 or higher
-			name := "<anonymous>"
-			if sym := t.Sym(); sym != nil {
-				name = sym.Name
-			}
-			base.WarnfAt(t.Pos(), "optimizing field layout for struct %s", name)
-		}
 		size = calcStructOffsetOptimized(t, fields)
-		
-		// Debug: verify offsets after optimization
-		if base.Debug.FieldAlign > 1 && len(fields) <= 5 {
-			symName := "<anon>"
-			if t.Sym() != nil {
-				symName = t.Sym().Name
-			}
-			for _, f := range fields {
-				fname := "<blank>"
-				if f.Sym != nil {
-					fname = f.Sym.Name
-				}
-				base.WarnfAt(t.Pos(), "  [%s] after opt: field %s has offset %d", symName, fname, f.Offset)
-			}
-		}
 	} else {
-		if base.Debug.FieldAlign > 1 && len(fields) > 1 {
-			// Print debug info about why we can't reorder
-			name := "<anonymous>"
-			if sym := t.Sym(); sym != nil {
-				name = sym.Name
-			}
-			base.WarnfAt(t.Pos(), "cannot optimize field layout for struct %s (has constraints)", name)
-		}
 		size = calcStructOffset(t, fields, 0)
 	}
 
